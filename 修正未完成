@@ -1,3 +1,16 @@
+def calculate_drag_reduction_rate(Re):
+    # 过滤非正值 Re，避免对数计算异常
+    if Re <= 0 or np.isinf(Re) or np.isnan(Re):
+        return 0.0  # 异常情况下降阻率设为 0（合理默认值）
+    # 对数公式计算降阻率（百分数）
+    drag_reduction_percent = -91 + 15.91 * np.log(Re)
+    # 转换为小数并限制在 0-1 范围（补充 a_min 和 a_max）
+    drag_reduction_rate = np.clip(drag_reduction_percent / 100, a_min=0.0, a_max=1.0)
+    return drag_reduction_rate
+
+
+
+
 def ctfi(displacement_per_min, sand_concentration_mass, sand_density, fluid_density, Z, D, R, u, dropoutrate, quantity,
          pdiameter, coeff2, detaTime=1):
     displacement_per_second = displacement_per_min / 60
