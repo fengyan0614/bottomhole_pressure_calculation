@@ -1,0 +1,429 @@
+import numpy as np
+import pandas as pd
+import os
+import matplotlib.pyplot as plt
+# 计算井筒内携沙液柱静压力
+def cfcpif(displacement_per_min, sand_concentration_mass, sand_density, fluid_density, g, Z, D, detaTime=1):
+    deta_Z = []  # 存储各段时间内质点位移增量
+    P_well_g = []  # 存储各段时间内的压力
+    displacement_per_second = displacement_per_min / 60
+    for k in range(len(displacement_per_second)):
+        v = 4 * displacement_per_second[k] / np.pi / D ** 2  # 计算当前时刻井筒流速
+        deta_Z.append(v * detaTime)  # 计算位移增量
+
+        if np.sum(deta_Z) < Z:  # 判断总位移是否小于井深
+            well_Z = deta_Z + [Z - np.sum(deta_Z)]  # 记录液柱段长度
+            well_sand_concentration = list(sand_concentration_mass[:k + 1]) + [0]  # 记录液柱段的砂浓度
+        else:
+            sum_so_far = 0
+            boundary = 0
+
+            # 根据总位移判断液柱段长度和砂浓度
+            for i in range(k, -1, -1):
+                sum_so_far += deta_Z[i]
+                if sum_so_far > Z:
+                    boundary = i
+                    break
+            well_Z = [deta_Z[i] for i in range(k, boundary, -1)]
+            well_Z = well_Z + [Z - np.sum(well_Z)]
+            well_sand_concentration = list(sand_concentration_mass[i] for i in range(k, boundary, -1)) + [sand_concentration_mass[boundary]]
+
+        # 确保砂浓度的长度和液柱段的长度一致
+        while len(well_sand_concentration) < len(well_Z):
+            well_sand_concentration.append(well_sand_concentration[-1])
+
+        # 将砂浓度转换为砂的体积占比
+        well_Vp = np.array(well_sand_concentration) / sand_density
+
+        # 计算混合液密度
+        well_mix_midu = (1 - well_Vp) * fluid_density + well_Vp * sand_density
+        # 计算压力，存入 P_well_g
+        P_well_g.append(np.sum(well_mix_midu * g * np.array(well_Z)))
+
+    return P_well_g  # 返回压力部分
+
+# 计算井筒摩阻
+def ctfi(displacement_per_min, sand_concentration_mass, sand_density, fluid_density, Z, D, R, u, dropoutrate, quantity, pdiameter, coeff2, detaTime=1):
+    displacement_per_second = displacement_per_min / 60
+    P_well_f = np.zeros(len(displacement_per_second))
+    deta_Z = np.zeros(len(displacement_per_second))
+    lamdas = []
+    N_well_f2_list = []  # 用于收集每个时间步的 N_well_f2
+
+    if isinstance(u, (int, float)):
+        u = np.full(len(displacement_per_second), u)
+
+    for t in range(len(displacement_per_second)):
+        v = 4 * displacement_per_min[t] / (np.pi * D ** 2)
+        Re_t = fluid_density * v * D / u[t]
+
+        if Re_t == 0:
+            lamda = 0
+        elif Re_t < 4000:
+            lamda = 64 / Re_t
+        else:
+            lamda = (1 / (-0.8686 * np.log((R / D) / 3.7 - 1.93 / Re_t * np.log((R / D) / 4.3 ** 1.1 + 6.05 / Re_t))) ** 2) * 0.2
+
+        deta_Z[t] = v * detaTime
+        well_Z = []
+        well_sand_concentration = []
+        well_mix_midu = []
+
+        if np.sum(deta_Z[:t + 1]) < Z:
+            well_Z = list(deta_Z[:t + 1]) + [Z - np.sum(deta_Z[:t + 1])]
+            well_sand_concentration = list(sand_concentration_mass[:t + 1]) + [0]
+        else:
+            sum_so_far = 0
+            boundary = 0
+            for i in range(t, -1, -1):
+                sum_so_far += deta_Z[i]
+                if sum_so_far > Z:
+                    boundary = i
+                    break
+            well_Z = list(deta_Z[i] for i in range(t, boundary, -1)) + [Z - np.sum(deta_Z[i] for i in range(t, boundary, -1))]
+            well_sand_concentration = list(sand_concentration_mass[i] for i in range(t, boundary, -1)) + [sand_concentration_mass[boundary]]
+
+        well_Vp = np.array(well_sand_concentration) / sand_density
+        well_mix_midu = (1 - well_Vp) * fluid_density + well_Vp * sand_density
+
+        # 使用 well_mix_midu 中当前时间步对应的数据
+        if len(well_mix_midu) > 0:
+            well_mix_midu_current = well_mix_midu[0]  # 假设使用第一个元素，根据实际情况调整
+        else:
+            well_mix_midu_current = 0
+
+        # 将 N_well_f 移到循环内，使用当前时间步的排量
+        N_well_f = (0.134 * well_mix_midu_current * (displacement_per_min[t] ** 2) / ((coeff2 ** 2) * (quantity ** 2) * (pdiameter ** 4)) * (displacement_per_min[t] ** 2)) + (1.8192 * (displacement_per_min[t] ** 0.5))
+        P_well_f[t] = np.sum(
+            np.array(well_Z) * ((lamda / D * v ** 2) * np.array(well_mix_midu) / 2)
+        ) * (1 - dropoutrate)
+    return P_well_f
+
+# 计算孔眼摩阻
+def cpf(displacement_per_min, fluid_density, sand_density, sand_concentration, quantity, pdiameter, coeff2):
+    sand_concentration_volume = sand_concentration / sand_density
+    friction_array = np.zeros(len(displacement_per_min))
+
+    for i, displacement in enumerate(displacement_per_min):
+        mixed_density = (1 - sand_concentration_volume[i]) * (fluid_density/1000) + sand_concentration_volume[i] * (sand_density/1000)
+        friction_array[i] = 0.237 * mixed_density * (displacement ** 2) / (
+                (coeff2 ** 2) * (quantity ** 2) * (pdiameter ** 2))
+
+    return friction_array
+
+
+def near_ctfi(displacement_per_min):
+
+    # 初始化近井筒摩阻系数数组
+    near_friction_array = np.zeros_like(displacement_per_min)
+
+    # 计算近井筒摩阻系数
+    for i, displacement in enumerate(displacement_per_min):
+        near_friction_array[i] = 1.373 * (displacement ** 0.5)
+
+    return near_friction_array
+
+# 计算井底净压力
+def calculate_bottomhole_pressure(wellhead_pressure, fluid_integral, tubing_friction_integral, perforation_friction, near_friction, min_horizontal_stress):
+    # 确保输入是 NumPy 数组
+    wellhead_pressure = np.array(wellhead_pressure)
+    fluid_integral = np.array(fluid_integral)
+    tubing_friction_integral = np.array(tubing_friction_integral)
+    perforation_friction = np.array(perforation_friction)
+    near_friction = np.array(near_friction)
+    # 计算井底净压力
+    bottomhole_pressure = wellhead_pressure + fluid_integral - tubing_friction_integral - perforation_friction - near_friction - min_horizontal_stress
+    return bottomhole_pressure
+
+# 绘图(井底净压力曲线)
+def plot_bottomhole_pressure_curve(time, pressure):
+    # 将时间从秒转换为分钟
+    time_in_minutes = [t / 60 for t in time]
+
+    # 绘制净压力随时间的变化曲线
+    plt.figure(figsize=(16, 8))
+    plt.rcParams['font.sans-serif'] = ['SimHei']  # 设置中文字体
+    plt.rcParams['axes.unicode_minus'] = False  # 允许负号正常显示
+    plt.plot(time_in_minutes, pressure, label='井底净压力')
+    plt.xlabel('时间 (min)', fontsize=16)
+    plt.ylabel('井底净压力 (MPa)', fontsize=16)
+    plt.title('井底净压力随时间的变化曲线', fontsize=16)
+    plt.legend(loc='upper right', fontsize=16)
+    # 设置标题
+    plt.title('井底净压力随时间的变化曲线', fontsize=16)
+    plt.grid(True)
+    plt.show()
+
+# 绘图(多坐标)
+def plot_all_components(time, dataset_tuple, label_tuple, title):
+    fig, ax = plt.subplots(figsize=(16, 8))  # 创建主图
+    plt.rcParams['font.sans-serif'] = ['SimHei']  # 设置中文字体
+    plt.rcParams['axes.unicode_minus'] = False  # 允许负号正常显示
+
+    # 颜色列表
+    colors = ['g', 'b', 'brown', 'c', 'orange', 'k', 'm', 'r', 'y']
+    color_iter = iter(colors)  # 将列表转换为迭代器
+    ax_secondary = None  # 新的 y 轴
+
+    # 检查输入数据的长度是否一致
+    if len(dataset_tuple) != len(label_tuple):
+        raise ValueError("dataset_tuple 和 label_tuple 的长度必须一致")
+    if len(time) != len(dataset_tuple[0]):
+        raise ValueError("time 的长度必须与 dataset_tuple 中每个数据集的长度一致")
+
+    try:
+        # 绘制所有数据
+        for i, (data, label) in enumerate(zip(dataset_tuple, label_tuple)):
+            try:
+                color = next(color_iter)
+            except StopIteration:
+                # 如果颜色用完了，从头开始
+                color_iter = iter(colors)
+                color = next(color_iter)
+
+            if '排量' in label or '砂浓度' in label or '黏度' in label:
+                # 为排量、砂浓度、黏度创建一个新的 y 轴
+                if ax_secondary is None:
+                    ax_secondary = ax.twinx()
+                    # 设置新 y 轴的范围为 0 - 500
+                    ax_secondary.set_ylim(0, 500)
+                ax_secondary.plot(time, data, color=color, label=label)
+                # 设置新 y 轴颜色匹配曲线
+                ax_secondary.yaxis.label.set_color(color)
+                ax_secondary.tick_params(axis='y', colors=color)
+            else:
+                ax.plot(time, data, color=color, label=label)
+
+        # 设置主 x 轴和 y 轴标签
+        ax.set_xlabel('时间 ($min$)', fontsize=16)
+        ax.set_ylabel('压力 ($MPa$)', fontsize=16)  # 假设所有数据单位为 MPa
+
+        # 设置 x 轴从 0 开始
+        ax.set_xlim(left=0)
+        # 设置主 y 轴从 0 开始
+        ax.set_ylim(0, 200)
+
+        # 合并图例
+        lines, labels = ax.get_legend_handles_labels()
+        if ax_secondary:
+            lines2, labels2 = ax_secondary.get_legend_handles_labels()
+            lines.extend(lines2)
+            labels.extend(labels2)
+        ax.legend(lines, labels, loc='upper left', fontsize=14)
+
+        # 设置标题
+        plt.title(title, fontsize=16)
+
+        # 添加网格
+        plt.grid(True)
+
+        # 调整布局
+        plt.tight_layout()
+
+        # 显示图表
+        plt.show()
+    except Exception as e:
+        print(f"绘图过程中出现错误: {e}")
+
+
+def plot_wellhead_parameters(time, wellhead_pressure, displacement,
+                             sand_concentration, viscosity,
+                             title="井口参数曲线"):
+    """
+    绘制井口参数曲线（副轴无文字，单位并入图例）
+    """
+    plt.rcParams['font.sans-serif'] = ['SimHei']
+    plt.rcParams['axes.unicode_minus'] = False
+
+    fig, ax1 = plt.subplots(figsize=(16, 8))
+
+    # ---- 主坐标轴：井口压力（左侧） ----
+    color1 = 'tab:red'
+    ax1.set_xlabel('时间 (min)', fontsize=25)
+    ax1.set_ylabel('井口压力 (MPa)', color=color1, fontsize=25)
+    ln1 = ax1.plot(time, wellhead_pressure, color=color1, linewidth=3, label='井口压力($MPa$)')
+    ax1.tick_params(axis='y', labelcolor=color1, labelsize=25)
+    ax1.tick_params(axis='x', labelsize=25)
+    ax1.set_xlim(left=0)
+    ax1.set_ylim(0, 190)
+
+    # ---- 副坐标轴1：排量 ----
+    ax2 = ax1.twinx()
+    color2 = 'tab:blue'
+    ax2.spines['right'].set_position(('outward', 0))
+    # 去掉轴标签文字
+    ax2.set_ylabel('')
+    ln2 = ax2.plot(time, displacement, color=color2, linewidth=3, label='排量 ($m^3/min$)')
+    ax2.tick_params(axis='y', labelcolor=color2, labelsize=25)
+    ax2.set_ylim(0, 40)
+
+    # ---- 副坐标轴2：砂浓度 ----
+    ax3 = ax1.twinx()
+    color3 = 'black'
+    ax3.spines['right'].set_position(('outward', 80))
+    ax3.set_ylabel('')
+    ln3 = ax3.plot(time, sand_concentration, color=color3, linewidth=3, label='砂浓度($kg/m^3$)')
+    ax3.tick_params(axis='y', labelcolor=color3, labelsize=25)
+    ax3.set_ylim(0, 1000)
+
+    # ---- 副坐标轴3：黏度 ----
+    ax4 = ax1.twinx()
+    color4 = 'tab:green'
+    ax4.spines['right'].set_position(('outward', 160))
+    ax4.set_ylabel('')
+    ln4 = ax4.plot(time, viscosity, color=color4, linewidth=3, label='黏度 ($mPa·s$)')
+    ax4.tick_params(axis='y', labelcolor=color4, labelsize=25)
+    ax4.set_ylim(0, 500)
+
+    # ---- 合并图例（含单位） ----
+    lines = ln1 + ln2 + ln3 + ln4
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels,
+               loc='upper right',
+               # bbox_to_anchor=(0.01, 0.99),
+               fontsize=30, frameon=True, borderaxespad=0.5)
+
+    # ---- 标题与布局 ----
+    plt.title(title, fontsize=25, pad=20)
+    plt.subplots_adjust(left=0.05, right=0.8, top=0.85, bottom=0.15)
+    ax1.grid(True, linestyle='--', alpha=0.7)
+    plt.show()
+
+def plot_pressure_components(time, tubing_friction, fluid_pressure, perforation_friction, near_bend_friction,
+                             bottomhole_net_pressure, wellhead_pressure,title="压力组分曲线"):
+    """
+    绘制各类压力组分曲线（均为MPa单位），颜色与井口参数曲线不重叠
+    """
+    # 设置中文字体
+    plt.rcParams['font.sans-serif'] = ['SimHei']
+    plt.rcParams['axes.unicode_minus'] = False
+
+    # 检查输入数据长度一致性
+    data_lengths = [len(tubing_friction), len(fluid_pressure), len(perforation_friction),
+                    len(near_bend_friction), len(bottomhole_net_pressure)]
+    if not all(length == len(time) for length in data_lengths):
+        raise ValueError("所有压力数据的长度必须与时间数据长度一致")
+
+    # 创建图形和坐标轴
+    fig, ax = plt.subplots(figsize=(16, 8))
+
+    # 重新定义颜色方案（与井口参数曲线颜色完全不重叠）
+    # 避开井口参数图使用的：blue（蓝）、green（绿）、red（红）、purple（紫）
+    styles = [
+        {'color': 'teal', 'linestyle': '-', 'linewidth': 3, 'label': '井筒摩阻 ($MPa$)'},  # 青色（不重叠）
+        {'color': 'olive', 'linestyle': '-', 'linewidth': 3, 'label': '液柱压力 ($MPa$)'},  # 橄榄绿（不重叠）
+        {'color': 'maroon', 'linestyle': '-', 'linewidth': 3, 'label': '孔眼摩阻 ($MPa$)'},  # 褐红色（不重叠）
+        {'color': 'gold', 'linestyle': '-', 'linewidth': 3, 'label': '近井弯曲摩阻 ($MPa$)'},  # 金色（不重叠）
+        {'color': 'darkorchid', 'linestyle': '-', 'linewidth': 3, 'label': '井底净压力($MPa$)'}, # 深紫（不重叠，加粗突出）
+    ]
+
+    # 绘制各压力组分曲线
+    ax.plot(time, tubing_friction, **styles[0])
+    ax.plot(time, fluid_pressure, **styles[1])
+    ax.plot(time, perforation_friction, **styles[2])
+    ax.plot(time, near_bend_friction, **styles[3])
+    ax.plot(time, bottomhole_net_pressure, **styles[4])
+
+
+    # 设置坐标轴标签和范围
+    ax.set_xlabel('时间 (min)', fontsize=30)
+    ax.set_ylabel('压力 ($MPa$)', fontsize=30)
+    ax.set_xlim(left=0)  # x轴从0开始
+    ax.set_ylim(0, 80)  # x轴从0开始
+    ax.tick_params(axis='x', labelsize=30)
+    ax.tick_params(axis='y', labelsize=30)
+    # 自动调整y轴范围（留10%余量）
+    all_pressures = [tubing_friction, fluid_pressure, perforation_friction,
+                     near_bend_friction, bottomhole_net_pressure]
+    min_p = min(np.min(data) for data in all_pressures)
+    max_p = max(np.max(data) for data in all_pressures)
+    y_margin = (max_p - min_p) * 0.1 if (max_p - min_p) != 0 else 10
+    # ax.set_ylim(min_p - y_margin, max_p + y_margin)
+
+    # 添加图例和标题
+    ax.legend(loc='upper right', fontsize=30)
+    # ax.set_title(title, fontsize=10)
+
+    # 添加网格线
+    ax.grid(True, linestyle='--', alpha=0.7)
+
+    # 调整布局
+    plt.tight_layout()
+
+    # 显示图表
+    plt.show()
+
+
+
+# 主函数，计算井底净压力
+def calculate_bottomhole_pressure_from_excel(excel_path):
+    g = 9.8  # 重力加速度，单位 m/s²
+    well_depth_Z = 5002  # 井深，单位为米
+    well_length_L = 6101  # 井筒长度，单位为米
+    sand_density = 2650  # 支撑剂密度，单位 kg/m³
+    fluid_density = 1000  # 压裂液密度，单位 kg/m³
+    well_diameter = 0.111  # 井筒直径，单位 m
+    min_horizontal_stress = 100
+    pdiameter = 0.011  # 孔眼直径 m
+    perforation_flow_coefficient = 0.95  # 孔眼流量系数
+    wellbore_roughness = 0.00001  # 井筒管壁绝对粗糙度，m
+    perforation_quantity = 30  # 第3-4、6-8、10-12、17-23段孔眼数量，个
+    dropoutrate = 0.85
+
+    data = pd.read_excel(excel_path, header=0)
+    displacement = data['排量'].values  # Excel文件中的排量列
+    viscosity = data['黏度'].values
+    sand_concentration = data["砂浓度"].values.astype(float)  # 读取时转换类型
+    wellhead_pressure_MPa = data['施工泵压'].values  # Excel文件中的排量列
+    wellhead_pressure = wellhead_pressure_MPa
+    time_in_seconds = data['时间']
+    fluid_viscosity = viscosity / 1000
+
+    # 井筒内携沙液柱静压力
+    fluid_integral = cfcpif(displacement, sand_concentration, sand_density, fluid_density, g, well_depth_Z, well_diameter)
+    # 井筒流动摩阻
+    tubing_friction_integral= ctfi(displacement, sand_concentration, sand_density, fluid_density, well_length_L, well_diameter, wellbore_roughness, fluid_viscosity, 1 - dropoutrate, perforation_quantity, pdiameter, perforation_flow_coefficient)
+    # 计算孔眼摩阻
+    perforation_friction = cpf(displacement, fluid_density, sand_density, sand_concentration, perforation_quantity, pdiameter, perforation_flow_coefficient)
+    # 计算近井筒摩阻
+    near_friction = near_ctfi(displacement)
+
+    tis = [val / 60 for val in time_in_seconds]
+    tfi = [val / 10000000000 for val in tubing_friction_integral]
+    fi = [(val / 1000000)for val in fluid_integral]
+    pf = [val/120 for val in perforation_friction]
+    nf = [val/3 for val in near_friction]
+    wp = [val for val in wellhead_pressure]
+    tfi1 = [(val * 1)for val in tfi]
+    # 计算井底净压力
+    bottomholepressure = calculate_bottomhole_pressure(wp, fi, tfi1, pf, nf, min_horizontal_stress)
+    # plot_bottomhole_pressure_curve(time_in_seconds, bottomholepressure)
+
+    # title = f"夏204X22段全部曲线绘制"
+    # dataset_tuple = (displacement, viscosity, tfi1, fi, pf,  tfi1, wp, bottomholepressure,sand_concentration)
+    # label_tuple = ('排量 ($m^3/min$) ', '黏度 ($mPa·s$)', '井筒摩阻 ($MPa$)', '液柱压力 ($MPa$)', '孔眼摩阻 ($MPa$)', '近井筒摩阻 ($MPa$)','井口压力($MPa$)', '井底净压力($MPa$)', '砂浓度($kg/m^3$)')
+    # plot_all_components(tis, dataset_tuple, label_tuple, title)
+
+    # 调用新的绘图函数
+    plot_wellhead_parameters(
+        tis,  # 时间（分钟）
+        wp,  # 井口压力
+        displacement,  # 排量
+        sand_concentration,  # 砂浓度
+        viscosity,  # 黏度
+        title="井口压力、排量、砂浓度和黏度曲线"
+    )
+
+    # 调用压力组分绘图函数
+    plot_pressure_components(
+        tis,  # 时间（分钟）
+        tfi1,  # 井筒摩阻
+        fi,  # 液柱压力
+        pf,  # 孔眼摩阻
+        nf,  # 近井弯曲摩阻
+        bottomholepressure,  # 井底净压力
+        wp,
+        title="夏204X21段压力组分曲线"
+    )
+
+    return bottomholepressure, time_in_seconds
